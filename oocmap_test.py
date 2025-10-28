@@ -32,6 +32,31 @@ def test_vacuum_reclaims_disk_space(tmp_path):
     del m
 
 
+def test_auto_vacuum_runs_after_threshold(tmp_path):
+    db_path = tmp_path / "map_auto.mdb"
+    m = OOCMap(str(db_path), max_size=SMALL_MAP)
+    m.configure_auto_vacuum(delete_threshold=3)
+    payload = "y" * 4096
+
+    for index in range(32):
+        m[index] = f"{payload}{index}"
+
+    size_after_inserts = db_path.stat().st_size
+
+    for index in range(2):
+        del m[index]
+
+    size_after_two_deletes = db_path.stat().st_size
+    assert size_after_two_deletes >= size_after_inserts
+
+    del m[2]
+
+    size_after_auto_vacuum = db_path.stat().st_size
+    assert size_after_auto_vacuum < size_after_two_deletes
+
+    del m
+
+
 def result_or_exception(fn):
     try:
         return fn()

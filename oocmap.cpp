@@ -914,6 +914,8 @@ static PyObject* OOCMap_new(PyTypeObject* type, PyObject* args, PyObject* kwds) 
             return nullptr;
         }
         mdb_env_set_maxdbs(self->mdb, 6);
+        self->deletesSinceVacuum = 0;
+        self->autoVacuumDeleteThreshold = 0;
     }
     return (PyObject*)self;
 }
@@ -1059,10 +1061,37 @@ static PyObject* OOCMap_vacuum(PyObject* pySelf, PyObject* Py_UNUSED(args)) {
             if(resizeError != MDB_SUCCESS)
                 throw MdbError(resizeError);
         }
+        self->deletesSinceVacuum = 0;
     } catch(const OocError& error) {
         error.pythonize();
         return nullptr;
     }
+
+    Py_RETURN_NONE;
+}
+
+static PyObject* OOCMap_configure_auto_vacuum(PyObject* pySelf, PyObject* args, PyObject* kwargs) {
+    if(!isOOCMap(pySelf)) {
+        PyErr_BadArgument();
+        return nullptr;
+    }
+
+    static const char *kwlist[] = {"delete_threshold", nullptr};
+    PyObject* thresholdObject = Py_None;
+    if(!PyArg_ParseTupleAndKeywords(args, kwargs, "|O", const_cast<char**>(kwlist), &thresholdObject))
+        return nullptr;
+
+    unsigned long long deleteThreshold = 0;
+    if(thresholdObject != Py_None) {
+        deleteThreshold = PyLong_AsUnsignedLongLong(thresholdObject);
+        if(PyErr_Occurred())
+            return nullptr;
+    }
+
+    OOCMapObject* self = reinterpret_cast<OOCMapObject*>(pySelf);
+    self->autoVacuumDeleteThreshold = deleteThreshold;
+    if(deleteThreshold == 0)
+        self->deletesSinceVacuum = 0;
 
     Py_RETURN_NONE;
 }
@@ -1098,6 +1127,7 @@ static int OOCMap_insert(PyObject* pySelf, PyObject* key, PyObject* value) {
     OOCMapObject* self = reinterpret_cast<OOCMapObject*>(pySelf);
 
     // start transaction
+    bool deleted = false;
     try {
         OOCTransaction txn(self, false);
 
@@ -1110,6 +1140,7 @@ static int OOCMap_insert(PyObject* pySelf, PyObject* key, PyObject* value) {
         if(value == nullptr) {
             // Deleting the value
             del(txn.txn, self->rootDb, &mdbKey);
+            deleted = true;
         } else {
             // Inserting a new value
             const EncodedValue* const encodedValue = OOCMap_encode(self, value, txn);
@@ -1127,6 +1158,20 @@ static int OOCMap_insert(PyObject* pySelf, PyObject* key, PyObject* value) {
         else
             error.pythonize();
         return -1;
+    }
+
+    if(deleted && self->autoVacuumDeleteThreshold > 0) {
+        // Opportunistically trigger an in-place vacuum once enough deletions
+        // have accumulated.  This keeps the map responsive by piggybacking on
+        // regular write traffic instead of requiring a dedicated maintenance
+        // window.
+        self->deletesSinceVacuum += 1;
+        if(self->deletesSinceVacuum >= self->autoVacuumDeleteThreshold) {
+            PyObject* vacuumResult = OOCMap_vacuum(pySelf, nullptr);
+            if(vacuumResult == nullptr)
+                return -1;
+            Py_DECREF(vacuumResult);
+        }
     }
 
     return 0;
@@ -1185,6 +1230,10 @@ static PyObject* OOCMap_get(PyObject* pySelf, PyObject* key) {
 //
 
 static PyMethodDef OOCMap_methods[] = {
+        {"configure_auto_vacuum", (PyCFunction)OOCMap_configure_auto_vacuum, METH_VARARGS | METH_KEYWORDS, PyDoc_STR(
+            "Configure automatic vacuum scheduling.\n\n"
+            "Pass delete_threshold > 0 to vacuum after that many successful deletions."
+            " Use 0 or None to disable automatic vacuuming.")},
         {"vacuum", (PyCFunction)OOCMap_vacuum, METH_NOARGS, PyDoc_STR("Reclaim unused storage from the map.")},
         {nullptr, nullptr, 0, nullptr}
 };

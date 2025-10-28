@@ -3,6 +3,10 @@
 #include <memory>
 #include <random>
 #include <chrono>
+#include <algorithm>
+#include <unordered_set>
+#include <vector>
+#include <cstring>
 #include "spooky.h"
 
 #include "errors.h"
@@ -12,6 +16,297 @@
 #include "lazydict.h"
 
 static std::mt19937 random_engine(std::chrono::system_clock::now().time_since_epoch().count());
+
+struct VacuumState {
+    std::vector<EncodedValue> toVisit;
+    std::unordered_set<uint64_t> ints;
+    std::unordered_set<uint64_t> strings;
+    std::unordered_set<uint64_t> tuples;
+    std::unordered_set<uint32_t> lists;
+    std::unordered_set<uint32_t> dicts;
+};
+
+// hardcoded values
+static const EncodedValue ENCODED_UNINITIALIZED = {{ .asUInt = 0 }, {{.typeCode = TYPE_CODE_HARDCODED, .lengthMinusOne = 0}}}; // This one has to be all zeros.
+static const EncodedValue ENCODED_NONE = {{.asUInt = 1}, {{.typeCode = TYPE_CODE_HARDCODED, .lengthMinusOne = 0}}};
+static const EncodedValue ENCODED_INT_ZERO = {{.asUInt = 2}, {{.typeCode = TYPE_CODE_HARDCODED, .lengthMinusOne = 0}}};
+static const EncodedValue ENCODED_TRUE = {{.asUInt = 3}, {{.typeCode = TYPE_CODE_HARDCODED, .lengthMinusOne = 0}}};
+static const EncodedValue ENCODED_FALSE = {{.asUInt = 4}, {{.typeCode = TYPE_CODE_HARDCODED, .lengthMinusOne = 0}}};
+static const EncodedValue ENCODED_EMPTY_TUPLE = {{.asUInt = 5}, {{.typeCode = TYPE_CODE_HARDCODED, .lengthMinusOne = 0}}};
+static const EncodedValue ENCODED_EMPTY_STRING = {{.asUInt = 6}, {{.typeCode = TYPE_CODE_HARDCODED, .lengthMinusOne = 0}}};
+
+static void vacuum_mark_value(
+    OOCMapObject* self,
+    OOCTransaction& txn,
+    VacuumState& state,
+    const EncodedValue& encodedValue
+);
+
+static void vacuum_sweep_hash_db(
+    MDB_txn* txn,
+    MDB_dbi dbi,
+    const std::unordered_set<uint64_t>& keep
+);
+
+static void vacuum_sweep_list_db(
+    MDB_txn* txn,
+    MDB_dbi dbi,
+    const std::unordered_set<uint32_t>& keep
+);
+
+static void vacuum_sweep_dict_db(
+    MDB_txn* txn,
+    MDB_dbi dbi,
+    const std::unordered_set<uint32_t>& keep
+);
+
+static void vacuum_mark_list(
+    OOCMapObject* self,
+    OOCTransaction& txn,
+    VacuumState& state,
+    const uint32_t listId
+) {
+    if(!state.lists.insert(listId).second)
+        return;
+
+    ListKey lengthKey = {
+        .listIndex = ListKey::listIndexLength,
+        .listId = listId
+    };
+    MDB_val mdbKey = { .mv_size = sizeof(lengthKey), .mv_data = &lengthKey };
+    MDB_val mdbValue;
+    const bool found = get(txn.txn, self->listsDb, &mdbKey, &mdbValue);
+    if(!found)
+        throw OocError(OocError::UnexpectedData);
+    if(mdbValue.mv_size != sizeof(uint32_t))
+        throw OocError(OocError::UnexpectedData);
+
+    uint32_t length = 0;
+    memcpy(&length, mdbValue.mv_data, sizeof(length));
+    for(uint32_t index = 0; index < length; ++index) {
+        ListKey elementKey = {
+            .listIndex = index,
+            .listId = listId
+        };
+        MDB_val elementMdbKey = { .mv_size = sizeof(elementKey), .mv_data = &elementKey };
+        MDB_val elementValue;
+        const bool elementFound = get(txn.txn, self->listsDb, &elementMdbKey, &elementValue);
+        if(!elementFound)
+            throw OocError(OocError::UnexpectedData);
+        if(elementValue.mv_size != sizeof(EncodedValue))
+            throw OocError(OocError::UnexpectedData);
+
+        EncodedValue element;
+        memcpy(&element, elementValue.mv_data, sizeof(element));
+        state.toVisit.push_back(element);
+    }
+}
+
+static void vacuum_mark_tuple(
+    OOCMapObject* self,
+    OOCTransaction& txn,
+    VacuumState& state,
+    const uint64_t tupleId
+) {
+    auto inserted = state.tuples.insert(tupleId);
+    if(!inserted.second)
+        return;
+
+    uint64_t keyCopy = tupleId;
+    MDB_val mdbKey = { .mv_size = sizeof(keyCopy), .mv_data = &keyCopy };
+    MDB_val mdbValue;
+    const bool found = get(txn.txn, self->tuplesDb, &mdbKey, &mdbValue);
+    if(!found)
+        throw OocError(OocError::UnexpectedData);
+    if(mdbValue.mv_size % sizeof(EncodedValue) != 0)
+        throw OocError(OocError::UnexpectedData);
+
+    const size_t count = mdbValue.mv_size / sizeof(EncodedValue);
+    EncodedValue* tupleValues = static_cast<EncodedValue*>(mdbValue.mv_data);
+    for(size_t i = 0; i < count; ++i)
+        state.toVisit.push_back(tupleValues[i]);
+}
+
+static void vacuum_mark_dict(
+    OOCMapObject* self,
+    OOCTransaction& txn,
+    VacuumState& state,
+    const uint32_t dictId
+) {
+    if(!state.dicts.insert(dictId).second)
+        return;
+
+    MDB_cursor* cursor = cursor_open(txn.txn, self->dictsDb);
+    try {
+        DictItemKey startKey = {
+            .dictId = dictId,
+            .key = ENCODED_UNINITIALIZED
+        };
+        MDB_val mdbKey = { .mv_size = sizeof(startKey), .mv_data = &startKey };
+        MDB_val mdbValue;
+        int rc = mdb_cursor_get(cursor, &mdbKey, &mdbValue, MDB_SET_RANGE);
+        if(rc == MDB_NOTFOUND) {
+            cursor_close(cursor);
+            return;
+        }
+        while(rc == MDB_SUCCESS) {
+            if(mdbKey.mv_size == sizeof(uint32_t)) {
+                uint32_t currentId = 0;
+                memcpy(&currentId, mdbKey.mv_data, sizeof(currentId));
+                if(currentId != dictId)
+                    break;
+            } else if(mdbKey.mv_size == sizeof(DictItemKey)) {
+                DictItemKey keyStruct;
+                memcpy(&keyStruct, mdbKey.mv_data, sizeof(keyStruct));
+                if(keyStruct.dictId != dictId)
+                    break;
+                if(mdbValue.mv_size != sizeof(EncodedValue))
+                    throw OocError(OocError::UnexpectedData);
+                state.toVisit.push_back(keyStruct.key);
+                EncodedValue value;
+                memcpy(&value, mdbValue.mv_data, sizeof(value));
+                state.toVisit.push_back(value);
+            } else {
+                throw OocError(OocError::UnexpectedData);
+            }
+
+            rc = mdb_cursor_get(cursor, &mdbKey, &mdbValue, MDB_NEXT);
+        }
+        if(rc != MDB_NOTFOUND)
+            throw MdbError(rc);
+        cursor_close(cursor);
+    } catch(...) {
+        cursor_close(cursor);
+        throw;
+    }
+}
+
+static void vacuum_mark_value(
+    OOCMapObject* self,
+    OOCTransaction& txn,
+    VacuumState& state,
+    const EncodedValue& encodedValue
+) {
+    switch(encodedValue.typeCode) {
+    case TYPE_CODE_LONG_POSITIVE_INT:
+    case TYPE_CODE_LONG_NEGATIVE_INT:
+        state.ints.insert(encodedValue.asUInt);
+        break;
+    case TYPE_CODE_UNICODE_LONG_WCHAR:
+    case TYPE_CODE_UNICODE_LONG_1BYTE:
+    case TYPE_CODE_UNICODE_LONG_2BYTE:
+    case TYPE_CODE_UNICODE_LONG_4BYTE:
+        state.strings.insert(encodedValue.asUInt);
+        break;
+    case TYPE_CODE_TUPLE:
+        vacuum_mark_tuple(self, txn, state, encodedValue.asUInt);
+        break;
+    case TYPE_CODE_LIST:
+        vacuum_mark_list(self, txn, state, encodedValue.asListKey.listId);
+        break;
+    case TYPE_CODE_DICT:
+        vacuum_mark_dict(self, txn, state, encodedValue.asDictKey.dictId);
+        break;
+    default:
+        break;
+    }
+}
+
+static void vacuum_sweep_hash_db(
+    MDB_txn* txn,
+    MDB_dbi dbi,
+    const std::unordered_set<uint64_t>& keep
+) {
+    MDB_cursor* cursor = cursor_open(txn, dbi);
+    try {
+        MDB_val key;
+        MDB_val value;
+        int rc = mdb_cursor_get(cursor, &key, &value, MDB_FIRST);
+        while(rc == MDB_SUCCESS) {
+            if(key.mv_size != sizeof(uint64_t))
+                throw OocError(OocError::UnexpectedData);
+
+            uint64_t hashKey = 0;
+            memcpy(&hashKey, key.mv_data, sizeof(hashKey));
+            if(keep.find(hashKey) == keep.end())
+                mdb_cursor_del(cursor, 0);
+
+            rc = mdb_cursor_get(cursor, &key, &value, MDB_NEXT);
+        }
+        if(rc != MDB_NOTFOUND)
+            throw MdbError(rc);
+        cursor_close(cursor);
+    } catch(...) {
+        cursor_close(cursor);
+        throw;
+    }
+}
+
+static void vacuum_sweep_list_db(
+    MDB_txn* txn,
+    MDB_dbi dbi,
+    const std::unordered_set<uint32_t>& keep
+) {
+    MDB_cursor* cursor = cursor_open(txn, dbi);
+    try {
+        MDB_val key;
+        MDB_val value;
+        int rc = mdb_cursor_get(cursor, &key, &value, MDB_FIRST);
+        while(rc == MDB_SUCCESS) {
+            if(key.mv_size != sizeof(ListKey))
+                throw OocError(OocError::UnexpectedData);
+
+            ListKey listKey;
+            memcpy(&listKey, key.mv_data, sizeof(listKey));
+            if(keep.find(listKey.listId) == keep.end())
+                mdb_cursor_del(cursor, 0);
+
+            rc = mdb_cursor_get(cursor, &key, &value, MDB_NEXT);
+        }
+        if(rc != MDB_NOTFOUND)
+            throw MdbError(rc);
+        cursor_close(cursor);
+    } catch(...) {
+        cursor_close(cursor);
+        throw;
+    }
+}
+
+static void vacuum_sweep_dict_db(
+    MDB_txn* txn,
+    MDB_dbi dbi,
+    const std::unordered_set<uint32_t>& keep
+) {
+    MDB_cursor* cursor = cursor_open(txn, dbi);
+    try {
+        MDB_val key;
+        MDB_val value;
+        int rc = mdb_cursor_get(cursor, &key, &value, MDB_FIRST);
+        while(rc == MDB_SUCCESS) {
+            if(key.mv_size == sizeof(uint32_t)) {
+                uint32_t dictId = 0;
+                memcpy(&dictId, key.mv_data, sizeof(dictId));
+                if(keep.find(dictId) == keep.end())
+                    mdb_cursor_del(cursor, 0);
+            } else if(key.mv_size == sizeof(DictItemKey)) {
+                DictItemKey dictKey;
+                memcpy(&dictKey, key.mv_data, sizeof(dictKey));
+                if(keep.find(dictKey.dictId) == keep.end())
+                    mdb_cursor_del(cursor, 0);
+            } else {
+                throw OocError(OocError::UnexpectedData);
+            }
+
+            rc = mdb_cursor_get(cursor, &key, &value, MDB_NEXT);
+        }
+        if(rc != MDB_NOTFOUND)
+            throw MdbError(rc);
+        cursor_close(cursor);
+    } catch(...) {
+        cursor_close(cursor);
+        throw;
+    }
+}
 
 const uint32_t ListKey::listIndexLength = std::numeric_limits<uint32_t>::max();
 
@@ -57,15 +352,6 @@ void OOCTransaction::abort() {
 // Functions that are not exposed to Python
 // These are allowed to throw exceptions.
 //
-
-// hardcoded values
-static const EncodedValue ENCODED_UNINITIALIZED = {{ .asUInt = 0 }, {{.typeCode = TYPE_CODE_HARDCODED, .lengthMinusOne = 0}}}; // This one has to be all zeros.
-static const EncodedValue ENCODED_NONE = {{.asUInt = 1}, {{.typeCode = TYPE_CODE_HARDCODED, .lengthMinusOne = 0}}};
-static const EncodedValue ENCODED_INT_ZERO = {{.asUInt = 2}, {{.typeCode = TYPE_CODE_HARDCODED, .lengthMinusOne = 0}}};
-static const EncodedValue ENCODED_TRUE = {{.asUInt = 3}, {{.typeCode = TYPE_CODE_HARDCODED, .lengthMinusOne = 0}}};
-static const EncodedValue ENCODED_FALSE = {{.asUInt = 4}, {{.typeCode = TYPE_CODE_HARDCODED, .lengthMinusOne = 0}}};
-static const EncodedValue ENCODED_EMPTY_TUPLE = {{.asUInt = 5}, {{.typeCode = TYPE_CODE_HARDCODED, .lengthMinusOne = 0}}};
-static const EncodedValue ENCODED_EMPTY_STRING = {{.asUInt = 6}, {{.typeCode = TYPE_CODE_HARDCODED, .lengthMinusOne = 0}}};
 
 const EncodedValue* OOCMap_encode(
     OOCMapObject* const self,
@@ -628,6 +914,8 @@ static PyObject* OOCMap_new(PyTypeObject* type, PyObject* args, PyObject* kwds) 
             return nullptr;
         }
         mdb_env_set_maxdbs(self->mdb, 6);
+        self->deletesSinceVacuum = 0;
+        self->autoVacuumDeleteThreshold = 0;
     }
     return (PyObject*)self;
 }
@@ -693,6 +981,121 @@ static int OOCMap_init(OOCMapObject* self, PyObject* args, PyObject* kwds) {
     return 0;
 }
 
+static PyObject* OOCMap_vacuum(PyObject* pySelf, PyObject* Py_UNUSED(args)) {
+    if(!isOOCMap(pySelf)) {
+        PyErr_BadArgument();
+        return nullptr;
+    }
+
+    OOCMapObject* self = reinterpret_cast<OOCMapObject*>(pySelf);
+
+    try {
+        OOCTransaction txn(self, false);
+        VacuumState state;
+
+        // LMDB exposes mdb_env_copy2(..., MDB_CP_COMPACT) which writes a new,
+        // compacted copy of the database to a separate path.  That is handy for
+        // offline maintenance, but it requires creating a second environment
+        // on disk and swapping files afterwards.  Our implementation instead
+        // reclaims unreachable values in-place while the map stays open and
+        // then shrinks the environment's map size so callers do not need to
+        // orchestrate an external copy step.
+
+        MDB_cursor* cursor = cursor_open(txn.txn, self->rootDb);
+        try {
+            MDB_val mdbKey;
+            MDB_val mdbValue;
+            int rc = mdb_cursor_get(cursor, &mdbKey, &mdbValue, MDB_FIRST);
+            while(rc == MDB_SUCCESS) {
+                if(mdbKey.mv_size != sizeof(EncodedValue) || mdbValue.mv_size != sizeof(EncodedValue))
+                    throw OocError(OocError::UnexpectedData);
+
+                EncodedValue encodedKey;
+                memcpy(&encodedKey, mdbKey.mv_data, sizeof(encodedKey));
+                state.toVisit.push_back(encodedKey);
+
+                EncodedValue encodedValue;
+                memcpy(&encodedValue, mdbValue.mv_data, sizeof(encodedValue));
+                state.toVisit.push_back(encodedValue);
+
+                rc = mdb_cursor_get(cursor, &mdbKey, &mdbValue, MDB_NEXT);
+            }
+            if(rc != MDB_NOTFOUND)
+                throw MdbError(rc);
+            cursor_close(cursor);
+        } catch(...) {
+            cursor_close(cursor);
+            throw;
+        }
+
+        while(!state.toVisit.empty()) {
+            EncodedValue encoded = state.toVisit.back();
+            state.toVisit.pop_back();
+            vacuum_mark_value(self, txn, state, encoded);
+        }
+
+        vacuum_sweep_hash_db(txn.txn, self->intsDb, state.ints);
+        vacuum_sweep_hash_db(txn.txn, self->stringsDb, state.strings);
+        vacuum_sweep_hash_db(txn.txn, self->tuplesDb, state.tuples);
+        vacuum_sweep_list_db(txn.txn, self->listsDb, state.lists);
+        vacuum_sweep_dict_db(txn.txn, self->dictsDb, state.dicts);
+
+        txn.commit();
+
+        MDB_stat envStat;
+        const int statError = mdb_env_stat(self->mdb, &envStat);
+        if(statError != MDB_SUCCESS)
+            throw MdbError(statError);
+
+        MDB_envinfo envInfo;
+        const int infoError = mdb_env_info(self->mdb, &envInfo);
+        if(infoError != MDB_SUCCESS)
+            throw MdbError(infoError);
+
+        const size_t usedSize = std::max<size_t>(
+            static_cast<size_t>(envStat.ms_psize) * 2,
+            (static_cast<size_t>(envInfo.me_last_pgno) + 1) * static_cast<size_t>(envStat.ms_psize));
+
+        if(usedSize < envInfo.me_mapsize) {
+            const int resizeError = mdb_env_set_mapsize(self->mdb, usedSize);
+            if(resizeError != MDB_SUCCESS)
+                throw MdbError(resizeError);
+        }
+        self->deletesSinceVacuum = 0;
+    } catch(const OocError& error) {
+        error.pythonize();
+        return nullptr;
+    }
+
+    Py_RETURN_NONE;
+}
+
+static PyObject* OOCMap_configure_auto_vacuum(PyObject* pySelf, PyObject* args, PyObject* kwargs) {
+    if(!isOOCMap(pySelf)) {
+        PyErr_BadArgument();
+        return nullptr;
+    }
+
+    static const char *kwlist[] = {"delete_threshold", nullptr};
+    PyObject* thresholdObject = Py_None;
+    if(!PyArg_ParseTupleAndKeywords(args, kwargs, "|O", const_cast<char**>(kwlist), &thresholdObject))
+        return nullptr;
+
+    unsigned long long deleteThreshold = 0;
+    if(thresholdObject != Py_None) {
+        deleteThreshold = PyLong_AsUnsignedLongLong(thresholdObject);
+        if(PyErr_Occurred())
+            return nullptr;
+    }
+
+    OOCMapObject* self = reinterpret_cast<OOCMapObject*>(pySelf);
+    self->autoVacuumDeleteThreshold = deleteThreshold;
+    if(deleteThreshold == 0)
+        self->deletesSinceVacuum = 0;
+
+    Py_RETURN_NONE;
+}
+
 static Py_ssize_t OOCMap_length(PyObject* pySelf) {
     if(!isOOCMap(pySelf)) {
         PyErr_BadArgument();
@@ -724,6 +1127,7 @@ static int OOCMap_insert(PyObject* pySelf, PyObject* key, PyObject* value) {
     OOCMapObject* self = reinterpret_cast<OOCMapObject*>(pySelf);
 
     // start transaction
+    bool deleted = false;
     try {
         OOCTransaction txn(self, false);
 
@@ -736,6 +1140,7 @@ static int OOCMap_insert(PyObject* pySelf, PyObject* key, PyObject* value) {
         if(value == nullptr) {
             // Deleting the value
             del(txn.txn, self->rootDb, &mdbKey);
+            deleted = true;
         } else {
             // Inserting a new value
             const EncodedValue* const encodedValue = OOCMap_encode(self, value, txn);
@@ -753,6 +1158,20 @@ static int OOCMap_insert(PyObject* pySelf, PyObject* key, PyObject* value) {
         else
             error.pythonize();
         return -1;
+    }
+
+    if(deleted && self->autoVacuumDeleteThreshold > 0) {
+        // Opportunistically trigger an in-place vacuum once enough deletions
+        // have accumulated.  This keeps the map responsive by piggybacking on
+        // regular write traffic instead of requiring a dedicated maintenance
+        // window.
+        self->deletesSinceVacuum += 1;
+        if(self->deletesSinceVacuum >= self->autoVacuumDeleteThreshold) {
+            PyObject* vacuumResult = OOCMap_vacuum(pySelf, nullptr);
+            if(vacuumResult == nullptr)
+                return -1;
+            Py_DECREF(vacuumResult);
+        }
     }
 
     return 0;
@@ -811,7 +1230,12 @@ static PyObject* OOCMap_get(PyObject* pySelf, PyObject* key) {
 //
 
 static PyMethodDef OOCMap_methods[] = {
-        {nullptr}, // sentinel
+        {"configure_auto_vacuum", (PyCFunction)OOCMap_configure_auto_vacuum, METH_VARARGS | METH_KEYWORDS, PyDoc_STR(
+            "Configure automatic vacuum scheduling.\n\n"
+            "Pass delete_threshold > 0 to vacuum after that many successful deletions."
+            " Use 0 or None to disable automatic vacuuming.")},
+        {"vacuum", (PyCFunction)OOCMap_vacuum, METH_NOARGS, PyDoc_STR("Reclaim unused storage from the map.")},
+        {nullptr, nullptr, 0, nullptr}
 };
 
 static PyMappingMethods OOCMap_mapping_methods = {

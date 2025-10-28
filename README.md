@@ -50,5 +50,26 @@ We're still missing some types that are commonly requested. Please make a PR if 
  * Numpy arrays
  * Torch/Tensorflow/Jax tensors
 
-Also, there is no garbage collector. You can delete things out of OOCMap, but the file backing it will never shrink.
-At a minimum, we should have a "vacuum" method that locks the whole map while it finds and deletes lost data.
+Vacuuming and space reclamation
+--------------------------------
+
+OOCMap includes an in-place `vacuum()` operation that reclaims disk space from
+deleted records by traversing the reachable objects and compacting the LMDB
+environment. The vacuum holds the map's write lock while it runs, so
+application code should trigger it at times when a brief pause is acceptable.
+
+You can invoke it manually:
+
+```python
+from oocmap import OOCMap
+
+m = OOCMap(path)
+...  # insert and delete
+m.vacuum()
+```
+
+For long-running workloads, `configure_auto_vacuum(delete_threshold)` enables
+automatic maintenance. Each successful deletion increments an internal counter;
+once the counter reaches the configured threshold the map vacuum runs
+opportunistically during that deletion and then resets the counter. Passing
+`None` disables automatic vacuuming.

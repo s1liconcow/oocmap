@@ -949,7 +949,9 @@ static int OOCMap_init(OOCMapObject* self, PyObject* args, PyObject* kwds) {
     const int mdbOpenError = mdb_env_open(
             self->mdb,
             filename,
-            MDB_NOSUBDIR | MDB_NOSYNC | MDB_WRITEMAP | MDB_NOMETASYNC| MDB_MAPASYNC | MDB_NOMEMINIT | MDB_NOTLS,
+            // Skip MDB_WRITEMAP so map resizing during vacuuming cannot SIGBUS
+            // other processes that are concurrently accessing the environment.
+            MDB_NOSUBDIR | MDB_NOSYNC | MDB_NOMETASYNC| MDB_MAPASYNC | MDB_NOMEMINIT | MDB_NOTLS,
             0644);
     Py_CLEAR(filenameObject);
     if(mdbOpenError != 0) {

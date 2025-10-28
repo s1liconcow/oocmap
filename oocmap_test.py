@@ -7,6 +7,31 @@ from oocmap import OOCMap
 
 SMALL_MAP = 32*1024*1024
 
+
+def test_vacuum_reclaims_disk_space(tmp_path):
+    db_path = tmp_path / "map.mdb"
+    m = OOCMap(str(db_path), max_size=SMALL_MAP)
+    payload = "x" * 4096
+
+    for index in range(32):
+        m[index] = f"{payload}{index}"
+
+    size_after_inserts = db_path.stat().st_size
+
+    for index in range(32):
+        del m[index]
+
+    size_after_deletes = db_path.stat().st_size
+    assert size_after_deletes >= size_after_inserts
+
+    m.vacuum()
+
+    size_after_vacuum = db_path.stat().st_size
+    assert size_after_vacuum < size_after_deletes
+
+    del m
+
+
 def result_or_exception(fn):
     try:
         return fn()

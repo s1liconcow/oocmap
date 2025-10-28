@@ -3,6 +3,7 @@
 
 #include <unordered_map>
 #include <vector>
+#include <cstdint>
 
 #include <cassert>
 #define STATIC_ASSERT(test_for_true) \
@@ -23,6 +24,8 @@ typedef struct {
     MDB_dbi listsDb;
     MDB_dbi tuplesDb;
     MDB_dbi dictsDb;
+    uint64_t deletesSinceVacuum;
+    uint64_t autoVacuumDeleteThreshold;
 } OOCMapObject;
 
 #pragma pack(push, 1)

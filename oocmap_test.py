@@ -1,3 +1,4 @@
+import multiprocessing
 import tempfile
 
 import pytest
@@ -6,6 +7,110 @@ from oocmap import OOCMap
 
 
 SMALL_MAP = 32*1024*1024
+
+
+def _auto_vacuum_worker(db_path, worker_id, operations):
+    m = OOCMap(db_path, max_size=SMALL_MAP)
+    m.configure_auto_vacuum(delete_threshold=max(1, operations // 2))
+    payload = f"{worker_id:03d}-" + ("z" * 1024)
+
+    for index in range(operations):
+        key = (worker_id << 32) | index
+        m[key] = f"{payload}{index}"
+
+    for index in range(operations):
+        key = (worker_id << 32) | index
+        del m[key]
+
+
+def test_vacuum_reclaims_disk_space(tmp_path):
+    db_path = tmp_path / "map.mdb"
+    m = OOCMap(str(db_path), max_size=SMALL_MAP)
+    payload = "x" * 4096
+
+    for index in range(32):
+        m[index] = f"{payload}{index}"
+
+    size_after_inserts = db_path.stat().st_size
+
+    for index in range(32):
+        del m[index]
+
+    size_after_deletes = db_path.stat().st_size
+    assert size_after_deletes >= size_after_inserts
+
+    m.vacuum()
+
+    size_after_vacuum = db_path.stat().st_size
+    if size_after_deletes > size_after_inserts:
+        assert size_after_vacuum < size_after_deletes
+    else:
+        assert size_after_vacuum == size_after_deletes
+
+    del m
+
+
+def test_auto_vacuum_runs_after_threshold(tmp_path):
+    db_path = tmp_path / "map_auto.mdb"
+    m = OOCMap(str(db_path), max_size=SMALL_MAP)
+    m.configure_auto_vacuum(delete_threshold=3)
+    payload = "y" * 4096
+
+    for index in range(32):
+        m[index] = f"{payload}{index}"
+
+    size_after_inserts = db_path.stat().st_size
+
+    for index in range(2):
+        del m[index]
+
+    size_after_two_deletes = db_path.stat().st_size
+    assert size_after_two_deletes >= size_after_inserts
+
+    del m[2]
+
+    size_after_auto_vacuum = db_path.stat().st_size
+    if size_after_two_deletes > size_after_inserts:
+        assert size_after_auto_vacuum < size_after_two_deletes
+    else:
+        assert size_after_auto_vacuum == size_after_two_deletes
+
+    del m
+
+
+def test_auto_vacuum_survives_concurrent_workers(tmp_path):
+    db_path = tmp_path / "map_auto_concurrent.mdb"
+    worker_count = 100
+    operations_per_worker = 12
+
+    start_method = "fork" if "fork" in multiprocessing.get_all_start_methods() else "spawn"
+    ctx = multiprocessing.get_context(start_method)
+    processes = [
+        ctx.Process(
+            target=_auto_vacuum_worker,
+            args=(str(db_path), worker_id, operations_per_worker),
+        )
+        for worker_id in range(worker_count)
+    ]
+
+    for process in processes:
+        process.start()
+
+    for process in processes:
+        process.join()
+        assert process.exitcode == 0
+
+    m = OOCMap(str(db_path), max_size=SMALL_MAP)
+    assert len(m) == 0
+
+    size_after_workers = db_path.stat().st_size
+    assert size_after_workers <= 1024 * 1024
+
+    m.vacuum()
+    assert db_path.stat().st_size == size_after_workers
+
+    del m
+
 
 def result_or_exception(fn):
     try:
